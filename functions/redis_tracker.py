@@ -9,8 +9,12 @@ from zoneinfo import ZoneInfo
 import redis
 
 from . import gps_log
+from .history_store import HistoryStore
+from .motion import combine_device_speeds, update_motion
+from .track_geometry import route_leg_lengths_km
 from .position_filter import (
     build_cumulative_km,
+    build_cumulative_km_from_legs,
     position_to_km,
     check_teleport,
     cluster_pings_by_km,
@@ -131,6 +135,16 @@ class RedisTrainTracker:
 
         self.train_data = None            # Reference to train schedule data
         self._cum_km_cache: Dict[str, Optional[List[float]]] = {}  # train_id -> cumulative km per stop
+
+        # Reporters' own GPS speed is only blended into the train's speed
+        # while it's this fresh (see _update_cached_position).
+        self.device_speed_max_age = 60
+        # 30-day journey history (functions/history_store.py) - optional,
+        # best-effort; position tracking never depends on it.
+        self.history: Optional[HistoryStore] = None
+        # Redis pub/sub channel announcing "this train's position changed",
+        # so every worker's LiveHub can push it to its socket subscribers.
+        self.updates_channel = "live:train_updates"
 
     def set_train_data(self, data: Dict):
         """Set reference to train schedule data for scheduled position calculations"""
@@ -351,9 +365,20 @@ class RedisTrainTracker:
         cum_km = None
         if self.train_data:
             stations = self.train_data.get("tid_to_stations", {}).get(train_id)
-            sid_to_sloc = self.train_data.get("sid_to_sloc", {})
+            sid_to_sloc = dict(self.train_data.get("xsid_to_sloc", {}) or {})
+            sid_to_sloc.update(self.train_data.get("sid_to_sloc", {}) or {})
             if stations:
-                cum_km = build_cumulative_km(stations, sid_to_sloc)
+                # Real along-track distance where track geometry knows the
+                # leg (track/track.db), straight line elsewhere.
+                try:
+                    cum_km = build_cumulative_km_from_legs(
+                        stations, route_leg_lengths_km(stations, sid_to_sloc)
+                    )
+                except Exception as e:
+                    print(f"Warning: track-based km failed for train {train_id}: {e}")
+                    cum_km = None
+                if cum_km is None:
+                    cum_km = build_cumulative_km(stations, sid_to_sloc)
 
         self._cum_km_cache[train_id] = cum_km
         return cum_km
@@ -460,7 +485,7 @@ class RedisTrainTracker:
         return True
 
     def push(self, train_id: str, user_id: str, position: float, timestamp: int,
-             is_bot: bool = False) -> Tuple[bool, str]:
+             is_bot: bool = False, speed_kmh: Optional[float] = None) -> Tuple[bool, str]:
         """
         Store a user's latest position update for a train.
         Only keeps the last update per user (overwrites previous).
@@ -695,6 +720,10 @@ class RedisTrainTracker:
             "pos": position,
             "ts": timestamp
         }
+        # The phone's own GPS speed (Doppler), if it sent one - blended into
+        # the train's speed estimate in _update_cached_position.
+        if speed_kmh is not None and 0 <= speed_kmh <= 200:
+            ping["spd"] = round(float(speed_kmh), 1)
 
         active_users_key = f"train:{train_id}:active_users"
         active_trains_key = "active_trains"
@@ -865,6 +894,24 @@ class RedisTrainTracker:
             if continuing and not at_station:
                 established_at = old_established_at
 
+        # Speed: how far the aggregate moved along the real track since the
+        # previous aggregate, blended with the reporters' own GPS speed.
+        device_speeds = [
+            p["spd"] for p in pings
+            if p.get("spd") is not None and max_timestamp - p["ts"] <= self.device_speed_max_age
+        ]
+        motion_key = f"train:{train_id}:motion"
+        prev_motion_raw = self.redis.get(motion_key)
+        prev_motion = json.loads(prev_motion_raw) if prev_motion_raw else None
+        final_km = position_to_km(cum_km, final_position) if cum_km else None
+        if prev_motion and max_timestamp < prev_motion.get("ts", 0):
+            motion = prev_motion  # an out-of-order (older) aggregate - don't rewind
+        else:
+            motion = update_motion(
+                prev_motion, final_position, final_km, max_timestamp,
+                combine_device_speeds(device_speeds),
+            )
+
         # Store as cached live position (short TTL, refreshed on each update)
         live_cache_key = f"train:{train_id}:cached_live"
         live_data = {
@@ -874,6 +921,8 @@ class RedisTrainTracker:
             "cached_at": current_time,
             "established_at": established_at,
             "last_user_id": last_user_id,
+            "speed_kmh": motion.get("speed"),
+            "moving": motion.get("moving", False),
         }
 
         # Store as last known position with 10-hour TTL (fallback)
@@ -889,7 +938,33 @@ class RedisTrainTracker:
         pipe = self.redis.pipeline()
         pipe.set(live_cache_key, json.dumps(live_data), ex=self.ttl)
         pipe.set(last_known_key, json.dumps(last_known_data), ex=self.last_known_ttl)
+        pipe.set(motion_key, json.dumps(motion), ex=self.last_known_ttl)
         pipe.execute()
+
+        if self.history is not None and motion is not prev_motion:
+            station_times = self._get_station_times(train_id)
+            stop_count = self._stop_count(train_id)
+            self.history.record(
+                train_id, station_times, stop_count, prev_motion, final_position,
+                max_timestamp, final_km, motion.get("speed"), total_active_users,
+            )
+
+        # Tell every worker's LiveHub this train has news for its subscribers.
+        try:
+            self.redis.publish(self.updates_channel, train_id)
+        except Exception as e:
+            print(f"Warning: live update publish failed for train {train_id}: {e}")
+
+    def _stop_count(self, train_id: str) -> int:
+        """Number of scheduled (type-1) stops - the position scale's range."""
+        if not self.train_data:
+            return 0
+        stations = self.train_data.get("tid_to_stations", {}).get(str(train_id)) or []
+        return sum(1 for s in stations if len(s) > 1 and s[1] == 1)
+
+    def get_motion(self, train_id: str) -> Optional[Dict]:
+        raw = self.redis.get(f"train:{train_id}:motion")
+        return json.loads(raw) if raw else None
     
     def get_train_bounds(self, train_id: str) -> Optional[Dict]:
         """
@@ -908,8 +983,11 @@ class RedisTrainTracker:
         reference = self._get_reference_position(train_id, int(time.time()))
         if reference is None:
             return None
-        position, ts = reference
-        return {"reference_position": position, "reference_timestamp": ts}
+        return {
+            "reference_position": reference["position"],
+            "reference_timestamp": reference["timestamp"],
+            "established_at": reference["established_at"],
+        }
 
     def get_train_position(self, train_id: str) -> Optional[Dict]:
         """
@@ -938,7 +1016,9 @@ class RedisTrainTracker:
                     "position": cached["position"],
                     "timestamp": cached["timestamp"],
                     "active_user": cached["active_user"],
-                    "is_live": True
+                    "is_live": True,
+                    "speed_kmh": cached.get("speed_kmh"),
+                    "moving": cached.get("moving", False),
                 }
                 result["unconfirmed"] = {
                     "position": cached["position"],
@@ -1002,6 +1082,8 @@ class RedisTrainTracker:
                         "timestamp": cached["timestamp"],
                         "active_user": cached["active_user"],
                         "is_live": True,
+                        "speed_kmh": cached.get("speed_kmh"),
+                        "moving": cached.get("moving", False),
                         "unconfirmed": {
                             "position": cached["position"],
                             "timestamp": cached["timestamp"]

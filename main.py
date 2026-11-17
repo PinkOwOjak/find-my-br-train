@@ -59,8 +59,22 @@ TRAIN_ROUTES = {}
 STATION_DISTANCES = {}
 
 # Redis-based train tracker (replaces AsyncTimedStack)
-tracker = RedisTrainTracker(host="localhost", port=6379, db=0, ttl_seconds=600)
+REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
+REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
+REDIS_DB = int(os.getenv("REDIS_DB", "0"))
+tracker = RedisTrainTracker(host=REDIS_HOST, port=REDIS_PORT, db=REDIS_DB, ttl_seconds=600)
 tracker.set_train_data(DATA)  # Provide train schedule data for scheduled position calculation
+
+# 30-day journey history (delay statistics + ETA prediction)
+from functions.history_store import HistoryStore
+history = HistoryStore()
+tracker.history = history
+
+# Live position WebSocket hub (/ws/live)
+from functions.live_hub import LiveHub
+live_hub = LiveHub(tracker, redis_host=REDIS_HOST, redis_port=REDIS_PORT, redis_db=REDIS_DB)
+
+from functions.track_geometry import shared_track
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -87,10 +101,16 @@ async def lifespan(app: FastAPI):
     print("="*60)
     TWO_TRAIN_ROUTES = precalculate_two_train_routes(DATA, CURRENT_REVISION)
     print("="*60 + "\n")
-    
+
+    shared_track().segment_count  # load track geometry up front, not on the first ping
+    await live_hub.start()
+    print("✓ Live WebSocket hub started (/ws/live)")
+
     yield
-    
+
     print("Shutting down FastAPI Server...")
+    await live_hub.stop()
+    history.close()
 
 
 app = FastAPI(
@@ -281,7 +301,60 @@ async def get_train_bounds_handler(train_id: str):
 
 @app.post("/sendupdate")
 async def receive_update_handler(update: positions.LocationUpdate):
-    return positions.receive_update(update, tracker)
+    result = positions.receive_update(update, tracker)
+    live_hub.mark_dirty(update.train_id or update.id)
+    return result
+
+
+# Live positions over one WebSocket per app (see functions/live_hub.py)
+from fastapi import WebSocket
+
+
+@app.websocket("/ws/live")
+async def live_socket_handler(websocket: WebSocket):
+    await live_hub.handle(websocket)
+
+
+# History & prediction endpoints
+from fastapi import HTTPException
+
+
+def _station_times_or_404(train_id: str):
+    station_times = tracker._get_station_times(train_id)
+    if not station_times or len(station_times) < 2:
+        raise HTTPException(404, f"No timetable for train {train_id}")
+    return station_times
+
+
+@app.get("/history/{train_id}/delays")
+async def get_delay_history_handler(train_id: str, days: int = 7):
+    """Per-run delay over the last `days` days (max 30), plus per-stop medians."""
+    _station_times_or_404(train_id)
+    from fastapi.concurrency import run_in_threadpool
+    return await run_in_threadpool(history.delay_summary, train_id, days)
+
+
+@app.get("/predict/{train_id}")
+async def get_prediction_handler(train_id: str):
+    """
+    Predicted delay and ETA at every scheduled stop ahead of the train's
+    current position, learned from up to 30 days of past runs. Returns
+    "stops": [] when there's no recent position to predict from.
+    """
+    import time as _time
+    from fastapi.concurrency import run_in_threadpool
+
+    station_times = _station_times_or_404(train_id)
+    info = tracker.get_positions([train_id]).get(train_id)
+    if not info or _time.time() - info.get("timestamp", 0) > 3 * 3600:
+        return {"train_id": train_id, "stops": [], "history_runs": 0, "based_on": None}
+    result = await run_in_threadpool(
+        history.predict, train_id, station_times, tracker._stop_count(train_id),
+        float(info["position"]), float(info["timestamp"]),
+    )
+    result["speed_kmh"] = info.get("speed_kmh")
+    result["is_live"] = info.get("is_live", False)
+    return result
 
 
 # Route endpoints
@@ -314,7 +387,10 @@ async def view_reports_handler():
 # Live endpoints
 @app.get("/health")
 async def health_check_handler():
-    return live.health_check(CURRENT_REVISION, tracker)
+    result = live.health_check(CURRENT_REVISION, tracker)
+    result["live_socket"] = live_hub.summary()
+    result["track_segments"] = shared_track().segment_count
+    return result
 
 
 @app.get("/live")
@@ -405,6 +481,9 @@ async def root():
             "/activetrains": "GET - Get active trains details",
             "/current/{train_ids}": "GET - Get current train positions",
             "/sendupdate": "POST - Submit location update",
+            "/ws/live": "WebSocket - live positions (subscribe) and rider updates",
+            "/history/{train_id}/delays?days=7": "GET - Delay history (up to 30 days)",
+            "/predict/{train_id}": "GET - Predicted delay/ETA for upcoming stops",
             "/fix": "POST - Report incorrect information",
             "/report": "GET - View all issue reports",
             "/nearbyroute": "POST - Find alternative routes",

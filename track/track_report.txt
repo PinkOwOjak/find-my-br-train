@@ -1,0 +1,33 @@
+Track build report
+==================
+Pairs with real track: 435 / 449
+Pairs drawn as straight lines: 14
+
+Stations more than 1 km from the nearest track (check these coordinates):
+    > 2 km  Sardah_Road (Sardah Road)  at 24.30494,88.72314
+    > 2 km  Janali_Hat  at 22.53227,91.89195
+    3.47 km  LOHAGARA  at 22.04426,92.10792
+    2.45 km  Ullapara  at 24.31331,89.56968
+    1.78 km  Lohagora  at 23.18819,89.64991
+    1.55 km  Tantibandha  at 23.97461,89.40855
+    1.23 km  Chabbishnagar  at 24.47196,88.49411
+    1.17 km  Kashinathpur  at 23.95763,89.60687
+    1.16 km  Noakhali  at 22.89068,91.09887
+    1.10 km  Gofurabad  at 24.17864,89.22002
+    1.04 km  Ramu  at 21.44549,92.09963
+
+Pairs drawn as straight lines (reason):
+  Borashi <-> Khatra: stations snap to the same point  [trains: 783, 784]
+  Dublia <-> Tantibandha: Tantibandha is 1553 m from any track  [trains: 779, 780]
+  HARBANG <-> LOHAGARA: LOHAGARA is 3469 m from any track  [trains: 10001, 10002, 813, 814, 815, 816]
+  Harian <-> Sardah_Road (Sardah Road): Sardah_Road is more than 2 km from any track  [trains: 31, 32, 5, 57, 58, 6]
+  Janali_Hat <-> Patiya: Janali_Hat is more than 2 km from any track  [trains: 821, 824]
+  Janali_Hat <-> Sholoshohor: Janali_Hat is more than 2 km from any track  [trains: 821, 824]
+  Kashiani <-> Lohagora: Lohagora is 1784 m from any track  [trains: 825, 826, 827, 828]
+  LOHAGARA <-> Satkania: LOHAGARA is 3469 m from any track  [trains: 10001, 10002, 813, 814, 815, 816]
+  Lahiri_Mohonpur <-> Ullapara: Ullapara is 2452 m from any track  [trains: 5, 705, 706, 751, 752, 753]
+  Lohagora <-> Narail: Lohagora is 1784 m from any track  [trains: 825, 826, 827, 828]
+  Nandangachi <-> Sardah_Road (Sardah Road): Sardah_Road is more than 2 km from any track  [trains: 31, 32, 5, 57, 58, 6]
+  Pabna <-> Tebunia: track path 26.9 km vs 8.0 km straight - likely wrong branch  [trains: 779, 780]
+  Sathia_Rajapur <-> Tantibandha: Tantibandha is 1553 m from any track  [trains: 779, 780]
+  Sholop <-> Ullapara: Ullapara is 2452 m from any track  [trains: 5, 705, 706, 751, 752, 753]

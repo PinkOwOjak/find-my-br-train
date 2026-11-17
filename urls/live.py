@@ -32,7 +32,10 @@ def get_active_trains_details(tracker) -> Dict:
             result[tid] = {
                 "position": info.get("position"),
                 "timestamp": info.get("timestamp"),
-                "active_user": info.get("active_user", 0)
+                "active_user": info.get("active_user", 0),
+                "is_live": True,
+                "speed_kmh": info.get("speed_kmh"),
+                "moving": info.get("moving", False),
             }
     return result
 

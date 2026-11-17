@@ -12,3 +12,12 @@ two_train_routes.json
 gps_updates.db
 gps_updates.db-wal
 gps_updates.db-shm
+# 30-day journey history (functions/history_store.py) - runtime data
+history.db
+history.db-wal
+history.db-shm
+
+# Raw Overpass exports used by tools/build_track.py (re-downloadable, 4+ MB)
+osm/*.json
+# Visual check output of tools/build_track.py --preview
+track/preview.png

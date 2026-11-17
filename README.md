@@ -41,6 +41,25 @@ The server will start on `http://localhost:8000`
 - `POST /sendupdate` - Submit location update
 - `POST /fix` - Report incorrect information
 - `GET /docs` - Interactive API documentation
+- `WS /ws/live` - Live positions over one WebSocket (subscribe to trains, riders send updates) - see `functions/live_hub.py` for the protocol
+- `GET /history/{train_id}/delays?days=7` - Per-day delay over the last 7/14/30 days
+- `GET /predict/{train_id}` - Predicted delay and ETA at each upcoming stop, learned from 30 days of history
+
+## 🛤️ Live tracking: track geometry, speed, history
+
+- **Track geometry** - `track/track.db` holds the real rail polyline between every pair of adjacent stations, built from OpenStreetMap by `tools/build_track.py` (see its docstring for the Overpass query). The same file ships inside the app as `assets/track/track.db`. Rebuild after changing stations/routes:
+  ```bash
+  python3 tools/build_track.py --app-asset ../assets/track/track.db --preview 702
+  ```
+  `track/track_report.txt` lists station coordinates that are far from any track (likely wrong) and pairs that fall back to straight lines. Track data © OpenStreetMap contributors (ODbL).
+- **Speed** - derived per train from along-track progress of the aggregated position, blended with riders' phone GPS speed (`functions/motion.py`), and included as `speed_kmh` / `moving` in `/current`, `/activetrains` and socket updates.
+- **History** - every train's aggregated position is recorded to `history.db` (SQLite, 30-day retention, train-level only - no user ids). Seed it from the existing GPS log once after deploying:
+  ```bash
+  python3 tools/backfill_history.py --gps gps_updates.db --history history.db
+  ```
+- **Reverse proxy** - `/ws/live` is a WebSocket: the proxy in front of uvicorn must pass the `Upgrade`/`Connection` headers for it (the same way it already does for `/chat/`). The app falls back to HTTP polling if the socket can't connect.
+- **Several workers** - live updates fan out across workers through Redis pub/sub (`live:train_updates`), so `gunicorn -w N` is safe.
+- Tests: `python3 -m pytest scratch/test_live_features.py -q` (needs local Redis; uses db 15).
 
 ## 🤝 Contributing
 

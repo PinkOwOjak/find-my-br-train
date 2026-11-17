@@ -86,6 +86,29 @@ def build_cumulative_km(stations: list, sid_to_sloc: Dict[str, list]) -> Optiona
     return cum_km
 
 
+def build_cumulative_km_from_legs(stations: list, legs_km: List[Optional[float]]) -> Optional[List[float]]:
+    """
+    Like build_cumulative_km, but from per-leg distances over the train's
+    *full* station list (stops, pass-through stations and via points - see
+    track_geometry.route_leg_lengths_km), so curves and every intermediate
+    point count. Legs with no distance fall back to the same rough 5 km
+    spacing build_cumulative_km uses for missing coordinates, spread over
+    the stop-to-stop leg they belong to.
+    """
+    stop_indices = [i for i, s in enumerate(stations) if len(s) > 1 and s[1] == 1]
+    if len(stop_indices) < 2 or len(legs_km) != len(stations) - 1:
+        return None
+    cum_km = [0.0]
+    for a, b in zip(stop_indices, stop_indices[1:]):
+        legs = legs_km[a:b]
+        if any(leg is None for leg in legs):
+            step = 5.0
+        else:
+            step = sum(legs)
+        cum_km.append(cum_km[-1] + max(step, 0.1))
+    return cum_km
+
+
 def position_to_km(cum_km: List[float], position: float) -> float:
     """Interpolate a fractional station-index position into cumulative km."""
     n = len(cum_km)
