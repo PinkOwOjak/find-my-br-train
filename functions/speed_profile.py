@@ -142,6 +142,85 @@ def run_cell_times(points: Sequence[Tuple[float, float]], cell_km: float = CELL_
     return out
 
 
+def compute_profiles(db_path: str, static: Dict[str, Tuple[List[float], List[str], Dict[int, int]]],
+                     now: float, since_date: str, cutoff_date: Optional[str] = None):
+    """
+    The CPU-heavy part of SpeedProfileModel.build, as a plain function so it
+    can run in another process. static: {train_id: (cum_km, stop_sids,
+    stop_minutes)}. Returns (medians {train_id: {cell: seconds}},
+    shared {(stop a, stop b, bucket): s/km}, runs {train_id: count}, rows).
+    """
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=10)
+    except sqlite3.Error as e:
+        print(f"SpeedProfileModel: cannot open {db_path}: {e}")
+        return {}, {}, {}, 0
+    try:
+        query = ("SELECT train_id, service_date, ts, position FROM run_point "
+                 "WHERE service_date >= ?" + (" AND service_date < ?" if cutoff_date else "") +
+                 " ORDER BY train_id, service_date, ts")
+        params = (since_date, cutoff_date) if cutoff_date else (since_date,)
+        rows = conn.execute(query, params).fetchall()
+    except sqlite3.Error as e:
+        print(f"SpeedProfileModel: history query failed: {e}")
+        rows = []
+    finally:
+        conn.close()
+
+    profiles: Dict[str, TrainProfile] = {}
+    shared: Dict[Tuple[str, str, int], List[Tuple[float, float]]] = {}
+    today = datetime.fromtimestamp(now, tz=BD_TZ).date()
+
+    def finish_run(profile: "TrainProfile", date: str, pts: List[Tuple[float, float]]):
+        if len(pts) < 2:
+            return
+        age = max(0, (today - datetime.strptime(date, "%Y-%m-%d").date()).days)
+        weight = 0.5 ** (age / RECENCY_HALF_LIFE_DAYS)
+        cells = run_cell_times(pts)
+        if not cells:
+            return
+        profile.runs += 1
+        for j, secs in cells.items():
+            secs = min(secs, MAX_CELL_S)
+            profile.samples.setdefault(j, []).append((secs, weight))
+            mid_km = (j + 0.5) * CELL_KM
+            if mid_km >= profile.total_km:
+                continue
+            k = profile.leg_of(mid_km)
+            leg_len = profile.cum_km[k + 1] - profile.cum_km[k]
+            if leg_len <= 0:
+                continue
+            bucket = min(SHARED_BUCKETS - 1, int((mid_km - profile.cum_km[k]) / leg_len * SHARED_BUCKETS))
+            key = (profile.stop_sids[k], profile.stop_sids[k + 1], bucket)
+            shared.setdefault(key, []).append((secs / CELL_KM, weight))  # pace, s/km
+
+    current_train, current_date, profile, pts = None, None, None, []
+    for train_id, date, ts, position in rows:
+        if train_id != current_train:
+            if profile is not None:
+                finish_run(profile, current_date, pts)
+            current_train, current_date, pts = train_id, date, []
+            profile = None
+            if train_id in static:
+                cum_km, stop_sids, stop_minutes = static[train_id]
+                profile = profiles[train_id] = TrainProfile(train_id, cum_km, stop_sids, stop_minutes)
+        if profile is None:
+            continue
+        if date != current_date:
+            finish_run(profile, current_date, pts)
+            current_date, pts = date, []
+        pts.append((float(ts), position_to_km(profile.cum_km, float(position))))
+    if profile is not None:
+        finish_run(profile, current_date, pts)
+
+    medians = {
+        tid: {j: weighted_median(v) for j, v in p.samples.items() if len(v) >= MIN_SAMPLES}
+        for tid, p in profiles.items()
+    }
+    shared_medians = {k: weighted_median(v) for k, v in shared.items() if len(v) >= MIN_SAMPLES}
+    return medians, shared_medians, {tid: p.runs for tid, p in profiles.items()}, len(rows)
+
+
 class TrainProfile:
     """Pace knowledge for one train: per-cell crossing time in seconds."""
 
@@ -191,92 +270,52 @@ class SpeedProfileModel:
         times = self.tracker._get_station_times(train_id) or []
         return cum_km, stop_sids, {k: m for k, m in times}
 
+    def _all_static(self) -> Dict[str, Tuple[List[float], List[str], Dict[int, int]]]:
+        out = {}
+        for tid in ((self.tracker.train_data or {}).get("tid_to_stations") or {}):
+            cum_km, stop_sids, stop_minutes = self._train_static(tid)
+            if cum_km and len(stop_sids) == len(cum_km):
+                out[str(tid)] = (cum_km, stop_sids, stop_minutes)
+        return out
+
     def build(self, now: Optional[float] = None, cutoff_date: Optional[str] = None,
-              since_date: Optional[str] = None) -> None:
+              since_date: Optional[str] = None, in_subprocess: bool = False) -> None:
         """
         (Re)build all profiles. cutoff_date (exclusive) / since_date
         (inclusive) restrict which service dates are learned from - used by
         the backtest to avoid learning from the runs it then predicts.
+
+        in_subprocess: do the CPU-heavy part (~30 s) in a separate process.
+        In the server this matters - a rebuild in a thread holds Python's GIL
+        and made API requests take seconds while it ran.
         """
         now = now or time.time()
         since_date = since_date or (
             datetime.fromtimestamp(now, tz=BD_TZ) - timedelta(days=RETENTION_DAYS)
         ).strftime("%Y-%m-%d")
-        try:
-            conn = sqlite3.connect(f"file:{self.history_db_path}?mode=ro", uri=True, timeout=10)
-        except sqlite3.Error as e:
-            print(f"SpeedProfileModel: cannot open {self.history_db_path}: {e}")
-            return
-        try:
-            query = ("SELECT train_id, service_date, ts, position FROM run_point "
-                     "WHERE service_date >= ?" + (" AND service_date < ?" if cutoff_date else "") +
-                     " ORDER BY train_id, service_date, ts")
-            params = (since_date, cutoff_date) if cutoff_date else (since_date,)
-            rows = conn.execute(query, params).fetchall()
-        except sqlite3.Error as e:
-            print(f"SpeedProfileModel: history query failed: {e}")
-            rows = []
-        finally:
-            conn.close()
+        static = self._all_static()
+        args = (self.history_db_path, static, now, since_date, cutoff_date)
+        if in_subprocess:
+            import concurrent.futures
+            import multiprocessing
+            ctx = multiprocessing.get_context("spawn")
+            with concurrent.futures.ProcessPoolExecutor(max_workers=1, mp_context=ctx) as pool:
+                medians, shared_medians, runs, n_rows = pool.submit(compute_profiles, *args).result(timeout=900)
+        else:
+            medians, shared_medians, runs, n_rows = compute_profiles(*args)
 
         profiles: Dict[str, TrainProfile] = {}
-        shared: Dict[Tuple[str, str, int], List[Tuple[float, float]]] = {}
-        today = datetime.fromtimestamp(now, tz=BD_TZ).date()
-
-        def finish_run(profile: TrainProfile, date: str, pts: List[Tuple[float, float]]):
-            if len(pts) < 2:
-                return
-            age = max(0, (today - datetime.strptime(date, "%Y-%m-%d").date()).days)
-            weight = 0.5 ** (age / RECENCY_HALF_LIFE_DAYS)
-            cells = run_cell_times(pts)
-            if not cells:
-                return
-            profile.runs += 1
-            for j, secs in cells.items():
-                secs = min(secs, MAX_CELL_S)
-                profile.samples.setdefault(j, []).append((secs, weight))
-                mid_km = (j + 0.5) * CELL_KM
-                if mid_km >= profile.total_km:
-                    continue
-                k = profile.leg_of(mid_km)
-                leg_len = profile.cum_km[k + 1] - profile.cum_km[k]
-                if leg_len <= 0:
-                    continue
-                bucket = min(SHARED_BUCKETS - 1, int((mid_km - profile.cum_km[k]) / leg_len * SHARED_BUCKETS))
-                key = (profile.stop_sids[k], profile.stop_sids[k + 1], bucket)
-                shared.setdefault(key, []).append((secs / CELL_KM, weight))  # pace, s/km
-
-        current_train, current_date, profile, pts = None, None, None, []
-        for train_id, date, ts, position in rows:
-            if train_id != current_train:
-                if profile is not None:
-                    finish_run(profile, current_date, pts)
-                current_train, current_date, pts = train_id, date, []
-                cum_km, stop_sids, stop_minutes = self._train_static(train_id)
-                profile = None
-                if cum_km and len(stop_sids) == len(cum_km):
-                    profile = TrainProfile(train_id, cum_km, stop_sids, stop_minutes)
-                    profiles[train_id] = profile
-            if profile is None:
-                continue
-            if date != current_date:
-                finish_run(profile, current_date, pts)
-                current_date, pts = date, []
-            pts.append((float(ts), position_to_km(profile.cum_km, float(position))))
-        if profile is not None:
-            finish_run(profile, current_date, pts)
-
-        # Collapse samples to medians once, so plan() never sorts anything.
-        for p in profiles.values():
-            p.medians = {j: weighted_median(v) for j, v in p.samples.items() if len(v) >= MIN_SAMPLES}
-            p.samples = {}
-        shared_medians = {k: weighted_median(v) for k, v in shared.items() if len(v) >= MIN_SAMPLES}
-
+        for tid, cells in medians.items():
+            cum_km, stop_sids, stop_minutes = static[tid]
+            p = TrainProfile(tid, cum_km, stop_sids, stop_minutes)
+            p.medians = cells
+            p.runs = runs.get(tid, 0)
+            profiles[tid] = p
         with self._lock:
             self._profiles = profiles
             self._shared = shared_medians
             self._built_at = time.time()
-        print(f"SpeedProfileModel: built {len(profiles)} train profiles from {len(rows)} history points")
+        print(f"SpeedProfileModel: built {len(profiles)} train profiles from {n_rows} history points")
 
     def _ensure_fresh(self):
         if time.time() - self._built_at < self.refresh_s or self._building:
@@ -285,7 +324,7 @@ class SpeedProfileModel:
 
         def run():
             try:
-                self.build()
+                self.build(in_subprocess=True)
             except Exception as e:
                 print(f"SpeedProfileModel: build failed: {e}")
             finally:

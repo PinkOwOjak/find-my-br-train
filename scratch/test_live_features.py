@@ -143,10 +143,15 @@ def test_history_delay_summary_and_prediction():
                 ts = int(_ts(2026, 11, day, h, mi))
                 store.record("T1", times, 4, prev, pos, ts, None, 50.0, 1)
                 prev = {"pos": pos, "ts": ts}
-        summary = store.delay_summary("T1", days=14, now=now)
+        summary = store.delay_summary("T1", days=14, now=now, station_times=times, stop_count=4)
         assert summary["runs"] == 5
-        assert summary["daily"][0]["delay_min"] == 25          # 11:25 vs 11:00 at the last stop
+        with_data = [d for d in summary["daily"] if d["delay_min"] is not None]
+        assert with_data[0]["delay_min"] == 25 and with_data[0]["source"] == "observed"  # 11:25 vs 11:00
         assert summary["max_delay_min"] == 25 and summary["min_delay_min"] == 25
+        # Every day of the window is listed; the 8 days without data are null
+        # (today, 17th, has nothing recorded yet and is left out, not "missing").
+        assert [d["date"] for d in summary["daily"]][0] == "2026-11-04"
+        assert summary["missing_days"] == 8 and len(summary["daily"]) == 13
 
         # Today's run: at stop 1 (position 1.0) at 09:40 -> 40 min late.
         pred = store.predict("T1", times, 4, 1.0, _ts(2026, 11, 17, 9, 40), now=now)
@@ -379,3 +384,79 @@ def test_plan_falls_back_to_timetable():
         assert 600 / 72 * 0.9 < km10 < 600 / 72 * 1.1
         secs, source = model.cell_seconds(model._profile_for("T"), 10)
         assert source == "timetable" and secs == pytest.approx(72 * CELL_KM, rel=0.01)
+
+
+# ---------------------------------------------------------------------------
+# Per-station delay history
+# ---------------------------------------------------------------------------
+
+def test_window_dates_skip_offdays():
+    now = _ts(2026, 11, 18, 12, 0)                     # Wednesday
+    dates, skipped = HistoryStore.window_dates(7, now, ["Fri"])
+    assert dates[-1] == "2026-11-18" and "2026-11-13" not in dates and skipped == ["2026-11-13"]
+    assert len(dates) == 6
+
+
+def test_stop_delay_history_observed_interpolated_estimated_missing_and_offday():
+    times = [(0, 8 * 60), (1, 9 * 60), (2, 10 * 60), (3, 11 * 60), (4, 12 * 60)]
+    now = _ts(2026, 11, 18, 20, 0)                     # Wed evening; window Thu 12th .. Wed 18th
+    with tempfile.TemporaryDirectory() as tmp:
+        store = HistoryStore(os.path.join(tmp, "h.db"))
+        db = store._db()
+
+        def point(date, h, mi, pos):
+            db.execute("INSERT INTO run_point VALUES ('S', ?, ?, ?, NULL, NULL, NULL, 1)",
+                       (date, int(_ts(*map(int, date.split("-")), h, mi)), pos))
+
+        # 12th: dense data, crossing of stop 2 recorded live at 10:20 -> observed 20 min.
+        store.record("S", times, 5, {"pos": 1.9, "ts": int(_ts(2026, 11, 12, 10, 15))}, 2.1,
+                     int(_ts(2026, 11, 12, 10, 25)), None, 50.0, 1)
+        # 14th: a 2-hour hole around stop 2: seen at 1.5 at 09:40, next at 2.5 at 11:10
+        # -> passing 2.0 interpolated at 10:25 -> 25 min late.
+        point("2026-11-14", 9, 40, 1.5)
+        point("2026-11-14", 11, 10, 2.5)
+        # 15th: data stops at 1.2 (scheduled 09:12) seen at 09:42 - 30 min late there; within
+        # 1.5 stops of stop 2 -> its delay is used as an estimate: 30.
+        point("2026-11-15", 9, 42, 1.2)
+        # 16th: data only near the origin (0.1) - too far from stop 2 -> missing.
+        point("2026-11-16", 8, 5, 0.1)
+        # 13th is Friday = off day -> not listed at all. 17th: nothing -> missing.
+        # 18th (today): nothing recorded yet -> left out, not missing.
+        db.commit()
+
+        h = store.stop_delay_history("S", times, 2, days=7, offdays=["Fri"], now=now)
+        by_date = {d["date"]: d for d in h["daily"]}
+        assert h["offdays_skipped"] == ["2026-11-13"] and "2026-11-13" not in by_date
+        assert by_date["2026-11-12"] == {"date": "2026-11-12", "delay_min": 20, "source": "observed"}
+        assert by_date["2026-11-14"]["delay_min"] == 25 and by_date["2026-11-14"]["source"] == "interpolated"
+        assert by_date["2026-11-15"]["delay_min"] == 30 and by_date["2026-11-15"]["source"] == "estimated"
+        assert by_date["2026-11-16"]["delay_min"] is None
+        assert by_date["2026-11-17"]["delay_min"] is None
+        assert "2026-11-18" not in by_date
+        assert h["runs"] == 3 and h["missing_days"] == 2
+        assert h["avg_delay_min"] == 25 and h["max_delay_min"] == 30 and h["min_delay_min"] == 20
+
+        # A run in progress that hasn't reached the stop yet isn't "missing".
+        point("2026-11-18", 19, 30, 0.4)
+        db.commit()
+        h2 = store.stop_delay_history("S", times, 4, days=1, now=now)
+        assert h2["daily"] == []
+        store.close()
+
+
+def test_implausibly_early_arrivals_are_ignored():
+    times = [(0, 8 * 60), (1, 9 * 60), (2, 10 * 60)]
+    now = _ts(2026, 11, 18, 20, 0)
+    with tempfile.TemporaryDirectory() as tmp:
+        store = HistoryStore(os.path.join(tmp, "h.db"))
+        db = store._db()
+        # 16th: "arrived" at stop 1 at 07:50 - 70 min early: a bad report.
+        db.execute("INSERT INTO station_event VALUES ('E', '2026-11-16', 1, ?, -70)", (int(_ts(2026, 11, 16, 7, 50)),))
+        # 17th: 5 min early - plausible, kept.
+        db.execute("INSERT INTO station_event VALUES ('E', '2026-11-17', 1, ?, -5)", (int(_ts(2026, 11, 17, 8, 55)),))
+        db.commit()
+        h = store.stop_delay_history("E", times, 1, days=3, now=now)
+        by_date = {d["date"]: d["delay_min"] for d in h["daily"]}
+        assert by_date["2026-11-16"] is None and by_date["2026-11-17"] == -5
+        assert h["min_delay_min"] == -5
+        store.close()

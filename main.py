@@ -332,12 +332,39 @@ def _station_times_or_404(train_id: str):
     return station_times
 
 
+def _offdays(train_id: str):
+    value = (DATA.get("offday") or {}).get(str(train_id)) or []
+    return [value] if isinstance(value, str) else list(value)
+
+
 @app.get("/history/{train_id}/delays")
 async def get_delay_history_handler(train_id: str, days: int = 7):
-    """Per-run delay over the last `days` days (max 30), plus per-stop medians."""
-    _station_times_or_404(train_id)
+    """Per-run delay over the last `days` days (max 30), plus per-stop medians.
+    Days without data are listed with delay_min null; off days are skipped."""
+    station_times = _station_times_or_404(train_id)
     from fastapi.concurrency import run_in_threadpool
-    return await run_in_threadpool(history.delay_summary, train_id, days)
+    return await run_in_threadpool(
+        history.delay_summary, train_id, days, None, station_times,
+        tracker._stop_count(train_id), _offdays(train_id),
+    )
+
+
+@app.get("/history/{train_id}/stop/{stop}")
+async def get_stop_delay_history_handler(train_id: str, stop: int, days: int = 7):
+    """Delay at one scheduled stop (0-based index among the train's type-1
+    stations) for each of the last `days` days, off days skipped."""
+    station_times = _station_times_or_404(train_id)
+    stop_count = tracker._stop_count(train_id)
+    if not 0 <= stop < stop_count:
+        raise HTTPException(404, f"Train {train_id} has {stop_count} scheduled stops")
+    from fastapi.concurrency import run_in_threadpool
+    result = await run_in_threadpool(
+        history.stop_delay_history, train_id, station_times, stop, days, _offdays(train_id),
+    )
+    stations = (DATA.get("tid_to_stations") or {}).get(str(train_id)) or []
+    stop_ids = [s[0] for s in stations if len(s) > 1 and s[1] == 1]
+    result["station_id"] = stop_ids[stop] if stop < len(stop_ids) else None
+    return result
 
 
 @app.get("/predict/{train_id}")
@@ -490,6 +517,7 @@ async def root():
             "/sendupdate": "POST - Submit location update",
             "/ws/live": "WebSocket - live positions (subscribe) and rider updates",
             "/history/{train_id}/delays?days=7": "GET - Delay history (up to 30 days)",
+            "/history/{train_id}/stop/{stop}?days=7": "GET - Delay history at one scheduled stop",
             "/predict/{train_id}": "GET - Predicted delay/ETA for upcoming stops",
             "/fix": "POST - Report incorrect information",
             "/report": "GET - View all issue reports",
