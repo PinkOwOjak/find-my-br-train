@@ -21,3 +21,8 @@ history.db-shm
 osm/*.json
 # Visual check output of tools/build_track.py --preview
 track/preview.png
+
+# Runtime data written by the server - must never come from git, or a deploy
+# (git reset --hard in restart_app.sh) replaces the real file with the repo copy.
+issue_reports.log
+output.log
