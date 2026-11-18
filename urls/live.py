@@ -21,8 +21,9 @@ def health_check(current_revision: int, tracker):
     }
 
 
-def get_active_trains_details(tracker) -> Dict:
-    """Return JSON details of currently active trains"""
+def get_active_trains_details(tracker, include_plan: bool = False) -> Dict:
+    """Return JSON details of currently active trains. The 10-minute motion
+    plan is opt-in (?plan=1) so older apps polling every 10 s don't pay for it."""
     active_trains = tracker.get_all_active_trains()
     positions = tracker.get_positions(active_trains)
     
@@ -37,6 +38,8 @@ def get_active_trains_details(tracker) -> Dict:
                 "speed_kmh": info.get("speed_kmh"),
                 "moving": info.get("moving", False),
             }
+            if include_plan:
+                result[tid]["plan"] = info.get("plan")
     return result
 
 

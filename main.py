@@ -76,6 +76,11 @@ live_hub = LiveHub(tracker, redis_host=REDIS_HOST, redis_port=REDIS_PORT, redis_
 
 from functions.track_geometry import shared_track
 
+# Learned pace profiles -> 10-minute motion plans (functions/speed_profile.py)
+from functions.speed_profile import SpeedProfileModel
+speed_model = SpeedProfileModel(history.db_path, tracker)
+tracker.speed_model = speed_model
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Manage application lifespan"""
@@ -103,6 +108,7 @@ async def lifespan(app: FastAPI):
     print("="*60 + "\n")
 
     shared_track().segment_count  # load track geometry up front, not on the first ping
+    speed_model._ensure_fresh()   # build pace profiles in the background
     await live_hub.start()
     print("✓ Live WebSocket hub started (/ws/live)")
 
@@ -390,6 +396,7 @@ async def health_check_handler():
     result = live.health_check(CURRENT_REVISION, tracker)
     result["live_socket"] = live_hub.summary()
     result["track_segments"] = shared_track().segment_count
+    result["speed_profiles"] = speed_model.summary()
     return result
 
 
@@ -399,8 +406,8 @@ async def view_live_trains_handler():
 
 
 @app.get("/activetrains")
-async def get_active_trains_handler():
-    return live.get_active_trains_details(tracker)
+async def get_active_trains_handler(plan: bool = False):
+    return live.get_active_trains_details(tracker, include_plan=plan)
 
 
 @app.get("/recent-conversations")

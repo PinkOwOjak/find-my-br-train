@@ -142,6 +142,9 @@ class RedisTrainTracker:
         # 30-day journey history (functions/history_store.py) - optional,
         # best-effort; position tracking never depends on it.
         self.history: Optional[HistoryStore] = None
+        # Learned pace profiles -> 10-minute motion plan per fix
+        # (functions/speed_profile.py). Optional; no plan without it.
+        self.speed_model = None
         # Redis pub/sub channel announcing "this train's position changed",
         # so every worker's LiveHub can push it to its socket subscribers.
         self.updates_channel = "live:train_updates"
@@ -912,6 +915,15 @@ class RedisTrainTracker:
                 combine_device_speeds(device_speeds),
             )
 
+        # Where the train will be over the next 10 minutes if no new report
+        # arrives - its own historical pace from here on (speed_profile.py).
+        plan = None
+        if self.speed_model is not None:
+            try:
+                plan = self.speed_model.plan(train_id, final_position, motion.get("speed"))
+            except Exception as e:
+                print(f"Warning: motion plan failed for train {train_id}: {e}")
+
         # Store as cached live position (short TTL, refreshed on each update)
         live_cache_key = f"train:{train_id}:cached_live"
         live_data = {
@@ -923,6 +935,7 @@ class RedisTrainTracker:
             "last_user_id": last_user_id,
             "speed_kmh": motion.get("speed"),
             "moving": motion.get("moving", False),
+            "plan": plan or None,
         }
 
         # Store as last known position with 10-hour TTL (fallback)
@@ -1019,6 +1032,7 @@ class RedisTrainTracker:
                     "is_live": True,
                     "speed_kmh": cached.get("speed_kmh"),
                     "moving": cached.get("moving", False),
+                    "plan": cached.get("plan"),
                 }
                 result["unconfirmed"] = {
                     "position": cached["position"],
@@ -1084,6 +1098,7 @@ class RedisTrainTracker:
                         "is_live": True,
                         "speed_kmh": cached.get("speed_kmh"),
                         "moving": cached.get("moving", False),
+                        "plan": cached.get("plan"),
                         "unconfirmed": {
                             "position": cached["position"],
                             "timestamp": cached["timestamp"]

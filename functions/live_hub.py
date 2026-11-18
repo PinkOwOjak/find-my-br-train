@@ -25,7 +25,8 @@
 #     {"t":"upd","trains":{"701":{...state...}|null}}    (null = no data any more)
 #     {"t":"ack","ref":7,"ok":true,"msg":"Position updated"}
 #     {"t":"pong","server_time":1763412345}
-#   state = {"position","timestamp","active_user","is_live","speed_kmh","moving"}
+#   state = {"position","timestamp","active_user","is_live","speed_kmh","moving",
+#            "plan": [[position, seconds_after_timestamp], ...] | null}
 
 import asyncio
 import json
@@ -47,7 +48,7 @@ MAX_MESSAGE_BYTES = 4096
 MAX_CLIENTS = 20000
 SEND_TIMEOUT_S = 5.0
 
-STATE_KEYS = ("position", "timestamp", "active_user", "is_live", "speed_kmh", "moving")
+STATE_KEYS = ("position", "timestamp", "active_user", "is_live", "speed_kmh", "moving", "plan")
 
 
 def public_state(info: Optional[Dict]) -> Optional[Dict]:

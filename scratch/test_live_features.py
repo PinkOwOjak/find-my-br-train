@@ -208,6 +208,8 @@ def test_live_socket_end_to_end():
     tracker.set_train_data(data)
     with tempfile.TemporaryDirectory() as tmp:
         tracker.history = HistoryStore(os.path.join(tmp, "h.db"))
+        from functions.speed_profile import SpeedProfileModel
+        tracker.speed_model = SpeedProfileModel(os.path.join(tmp, "h.db"), tracker)
         from functions import gps_log
         gps_log.DB_PATH, gps_log._conn = os.path.join(tmp, "gps.db"), None
         hub = LiveHub(tracker, redis_db=15)
@@ -255,6 +257,12 @@ def test_live_socket_end_to_end():
                 assert state2["position"] == pytest.approx(0.48)
                 assert state2["speed_kmh"] is not None and 20 < state2["speed_kmh"] < 80
                 assert state2["moving"] is True
+                # 10-minute motion plan: starts at the fix, never goes backwards
+                plan = state2["plan"]
+                assert plan and plan[0] == [pytest.approx(0.48, abs=1e-4), 0]
+                assert plan[-1][1] == 600
+                assert all(b[0] >= a[0] and b[1] > a[1] for a, b in zip(plan, plan[1:]))
+                assert plan[-1][0] > plan[0][0]   # timetable pace moves it forward
 
                 # Throttled rider + ping/pong
                 rider.send_json({"t": "pos", "ref": 3, "train_id": tid, "position": 0.5, "time": t0 * 1000})
@@ -270,3 +278,104 @@ def test_live_socket_end_to_end():
     tracker.redis.delete(*([k for k in tracker.redis.scan_iter(f"train:{tid}:*")] or ["_none_"]))
     tracker.redis.srem("active_trains", tid)
     tracker.redis.srem("all_trains_with_history", tid)
+
+
+# ---------------------------------------------------------------------------
+# Speed profiles / 10-minute motion plan
+# ---------------------------------------------------------------------------
+
+from functions.speed_profile import (  # noqa: E402
+    CELL_KM, SpeedProfileModel, TrainProfile, km_to_position, run_cell_times,
+)
+from functions.position_filter import position_to_km as _p2km  # noqa: E402
+
+
+def test_km_position_round_trip():
+    cum = [0.0, 12.0, 30.5, 31.0, 80.0]
+    for pos in (0.0, 0.25, 1.0, 1.7, 2.5, 3.999, 4.0):
+        assert km_to_position(cum, _p2km(cum, pos)) == pytest.approx(pos, abs=1e-9)
+
+
+def test_run_cell_times_capture_dwell_and_skip_gaps():
+    # 60 km/h (1 km/min) to km 1.0, stand 180 s, continue at 60 km/h.
+    pts = [(0, 0.0), (30, 0.5), (60, 1.0), (240, 1.0), (270, 1.5), (300, 2.0)]
+    cells = run_cell_times(pts)
+    assert 0 not in cells                           # start boundary never crossed - not measurable
+    assert cells[1] == pytest.approx(12)            # 0.2 km at 1 km/min
+    assert cells[4] == pytest.approx(12)            # last cell before the stop
+    assert cells[5] == pytest.approx(180 + 12)      # cell starting at the stop holds the dwell
+    # a 40-minute hole in the data must not be learned as one very slow stretch
+    cells2 = run_cell_times([(0, 0.0), (60, 1.0), (60 + 2400, 3.0), (2520, 4.0)])
+    assert 2 in cells2 and 16 in cells2             # measured inside each unbroken chain
+    assert all(c not in cells2 for c in range(5, 16))   # nothing learned across the hole
+
+
+class _FakeTracker:
+    """Just the timetable helpers SpeedProfileModel needs."""
+    def __init__(self, cum_km, stop_sids, times):
+        self.cum_km, self.times = cum_km, times
+        self.train_data = {"tid_to_stations": {"T": [[sid, 1, "00:00"] for sid in stop_sids]}}
+    def _get_cumulative_km(self, tid):
+        return self.cum_km
+    def _get_station_times(self, tid):
+        return self.times
+
+
+def _seed_history(path, runs):
+    store = HistoryStore(path)
+    db = store._db()
+    for date, pts in runs:
+        day = int(date[-2:]) * 86400
+        for ts, pos in pts:
+            db.execute("INSERT INTO run_point VALUES ('T', ?, ?, ?, NULL, NULL, NULL, 1)", (date, day + ts, pos))
+    db.commit()
+    store.close()
+
+
+def test_plan_follows_history_and_dwells_at_station():
+    cum = [0.0, 5.0, 10.0]                         # stops A (km 0), B (km 5), C (km 10)
+    tr = _FakeTracker(cum, ["A", "B", "C"], [(0, 600), (1, 610), (2, 620)])
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "h.db")
+        # Every past run: 60 km/h, a 4-minute stop at B, 60 km/h again.
+        runs = []
+        for d in range(1, 6):
+            date = f"2026-11-0{d}"
+            pts, t = [], 0
+            for i in range(0, 51):                  # km 0 -> 5 in 300 s
+                pts.append((t + i * 6, i * 0.1 / 5))
+            t = 300 + 240                           # dwell at B
+            for i in range(0, 51):
+                pts.append((t + i * 6, 1 + i * 0.1 / 5))
+            runs.append((date, pts))
+        _seed_history(path, runs)
+        model = SpeedProfileModel(path, tr, refresh_s=1e9)
+        model.build(now=datetime.datetime(2026, 11, 10, tzinfo=BD_TZ).timestamp(), since_date="2026-10-01")
+        prof = model._profile_for("T")
+        assert prof.runs == 5 and len(prof.medians) >= 45
+
+        # From km 3.0 at speed 60: reaches B (km 5) after ~120 s, stands
+        # ~4 min, then continues.
+        plan = model.plan("T", km_to_position(cum, 3.0), 60.0)
+        km = {t: _p2km(cum, p) for p, t in plan}
+        assert km[90] == pytest.approx(4.5, abs=0.3)
+        assert 4.7 < km[180] <= 5.25 and 4.7 < km[300] <= 5.25    # standing at B
+        assert km[600] > 7.0                                       # left B and kept going
+
+        # A train reported stopped holds for a minute before following history.
+        stopped = model.plan("T", km_to_position(cum, 2.0), 0.0)
+        assert _p2km(cum, stopped[2][0]) == pytest.approx(2.0, abs=1e-6)   # t = 60 s
+        assert _p2km(cum, stopped[4][0]) > 2.3                              # t = 120 s
+
+
+def test_plan_falls_back_to_timetable():
+    cum = [0.0, 20.0, 40.0]
+    # 20 km legs scheduled at 25 min each -> ~(1500-60)/20 = 72 s/km running pace
+    tr = _FakeTracker(cum, ["A", "B", "C"], [(0, 600), (1, 625), (2, 650)])
+    with tempfile.TemporaryDirectory() as tmp:
+        model = SpeedProfileModel(os.path.join(tmp, "missing.db"), tr, refresh_s=1e9)
+        plan = model.plan("T", 0.0, None)
+        km10 = _p2km(cum, plan[-1][0])
+        assert 600 / 72 * 0.9 < km10 < 600 / 72 * 1.1
+        secs, source = model.cell_seconds(model._profile_for("T"), 10)
+        assert source == "timetable" and secs == pytest.approx(72 * CELL_KM, rel=0.01)
