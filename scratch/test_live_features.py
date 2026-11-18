@@ -460,3 +460,26 @@ def test_implausibly_early_arrivals_are_ignored():
         assert by_date["2026-11-16"] is None and by_date["2026-11-17"] == -5
         assert h["min_delay_min"] == -5
         store.close()
+
+
+def test_backup_status_summary():
+    import json
+    from datetime import datetime, timezone
+    from functions import backup_status
+    now = datetime(2026, 11, 19, 12, 0, tzinfo=timezone.utc)
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "status.json")
+        assert backup_status.summary(path, now)["ok"] is None          # never ran
+        status = {"ok": True, "finished_at": "2026-11-18T22:01:00+00:00",
+                  "projects": {"find-my-train": {"ok": True, "error": None},
+                               "clash-of-empires": {"ok": True, "error": None}}}
+        json.dump(status, open(path, "w"))
+        s = backup_status.summary(path, now)
+        assert s["ok"] is True and s["projects_ok"] == "2/2" and s["age_hours"] == 14.0
+        assert "clash-of-empires" not in json.dumps(s)                  # public endpoint: no names
+        assert backup_status.summary(path, datetime(2026, 11, 20, 12, 0, tzinfo=timezone.utc))["ok"] is False  # missed a night
+        status["ok"] = False
+        status["projects"]["clash-of-empires"] = {"ok": False, "error": "mysqldump failed"}
+        json.dump(status, open(path, "w"))
+        s = backup_status.summary(path, now)
+        assert s["ok"] is False and s["projects_ok"] == "1/2" and "mysqldump" not in json.dumps(s)

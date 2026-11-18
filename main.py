@@ -6,6 +6,7 @@ from contextlib import asynccontextmanager
 import uvicorn
 
 # Import utility functions
+from functions import backup_status
 from functions.data_loader import load_data
 from functions.redis_tracker import RedisTrainTracker
 from functions.route_calculator import (
@@ -424,6 +425,7 @@ async def health_check_handler():
     result["live_socket"] = live_hub.summary()
     result["track_segments"] = shared_track().segment_count
     result["speed_profiles"] = speed_model.summary()
+    result["backup"] = backup_status.summary()
     return result
 
 
